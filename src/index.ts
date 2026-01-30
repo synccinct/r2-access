@@ -1,4 +1,3 @@
-
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
@@ -90,7 +89,7 @@ async function generatePresignedPut(req: PresignedRequest, env: Env): Promise<Re
     const client = getS3Client(env);
 
     const command = new PutObjectCommand({
-      Bucket: 'a11y-docs-input',
+      Bucket: 'a11y-document-bucket',
       Key: key,
     });
 
@@ -126,7 +125,7 @@ async function generatePresignedGet(req: PresignedRequest, env: Env): Promise<Re
     const client = getS3Client(env);
 
     const command = new GetObjectCommand({
-      Bucket: 'a11y-docs-input',
+      Bucket: 'a11y-document-bucket',
       Key: key,
     });
 
