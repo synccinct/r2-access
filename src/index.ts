@@ -1,6 +1,3 @@
-import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
-import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-
 interface Env {
   R2_BUCKET: R2Bucket;
   DB: D1Database;
@@ -30,18 +27,87 @@ interface UpdateAuditRequest {
   }>;
 }
 
-// Initialize S3 client for R2
-function getS3Client(env: Env): S3Client {
-  return new S3Client({
-    region: 'auto',
-    credentials: {
-      accessKeyId: env.R2_ACCESS_KEY_ID,
-      secretAccessKey: env.R2_SECRET_ACCESS_KEY,
-    },
-  });
+// --- R2 proxy implementation -------------------------------------------------
+// We keep the existing `/presigned-put` and `/presigned-get` routes for compatibility
+// but return worker URLs that the client should call to upload/download through
+// the Worker (proxy). This avoids pulling the AWS SDK into the Worker runtime.
+
+function makeWorkerUploadUrl(requestUrl: string, key: string) {
+  const origin = new URL(requestUrl).origin;
+  return `${origin}/upload/${encodeURIComponent(key)}`;
 }
 
-// Endpoint 1: Create Audit Record in D1
+function makeWorkerDownloadUrl(requestUrl: string, key: string) {
+  const origin = new URL(requestUrl).origin;
+  return `${origin}/download/${encodeURIComponent(key)}`;
+}
+
+// Preserve old handler signature: client asks for a "presigned" URL, we return
+// a worker-managed upload URL (proxy) and expiry metadata.
+async function generatePresignedPut(req: PresignedRequest, env: Env, requestUrl?: string): Promise<Response> {
+  try {
+    const { key, expiresIn } = req;
+    if (!key) return new Response(JSON.stringify({ success: false, error: 'missing key' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+
+    const uploadUrl = makeWorkerUploadUrl(requestUrl ?? 'https://example.com', key);
+    const expiresAt = new Date(Date.now() + expiresIn * 1000);
+
+    return new Response(JSON.stringify({ success: true, uploadUrl, expiresIn, expiresAt: expiresAt.toISOString(), key }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (err) {
+    console.error('generatePresignedPut error:', err);
+    return new Response(JSON.stringify({ success: false, error: err instanceof Error ? err.message : 'Unknown error' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  }
+}
+
+// Return a worker download URL that proxies the R2 object.
+async function generatePresignedGet(req: PresignedRequest, env: Env, requestUrl?: string): Promise<Response> {
+  try {
+    const { key, expiresIn } = req;
+    if (!key) return new Response(JSON.stringify({ success: false, error: 'missing key' }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+
+    const downloadUrl = makeWorkerDownloadUrl(requestUrl ?? 'https://example.com', key);
+    const expiresAt = new Date(Date.now() + expiresIn * 1000);
+
+    return new Response(JSON.stringify({ success: true, downloadUrl, expiresIn, expiresAt: expiresAt.toISOString(), key }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  } catch (err) {
+    console.error('generatePresignedGet error:', err);
+    return new Response(JSON.stringify({ success: false, error: err instanceof Error ? err.message : 'Unknown error' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  }
+}
+
+// Proxy upload endpoint: POST /upload/:key  (client PUT/POSTs file bytes here)
+async function handleUploadProxy(request: Request, env: Env, key: string): Promise<Response> {
+  try {
+    const contentType = request.headers.get('content-type') || 'application/octet-stream';
+    const buf = await request.arrayBuffer();
+    await env.R2_BUCKET.put(key, buf, { httpMetadata: { contentType } });
+    return new Response(JSON.stringify({ success: true, key, size: buf.byteLength }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  } catch (err) {
+    console.error('R2 upload error:', err);
+    return new Response(JSON.stringify({ success: false, error: err instanceof Error ? err.message : 'Unknown error' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  }
+}
+
+// Proxy download endpoint: GET /download/:key
+async function handleDownloadProxy(key: string, env: Env): Promise<Response> {
+  try {
+    const obj = await env.R2_BUCKET.get(key);
+    if (!obj || !obj.body) return new Response(JSON.stringify({ success: false, error: 'not_found' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+    const contentType = obj.httpMetadata?.contentType || 'application/octet-stream';
+    return new Response(obj.body, { status: 200, headers: { 'Content-Type': contentType } });
+  } catch (err) {
+    console.error('R2 download error:', err);
+    return new Response(JSON.stringify({ success: false, error: err instanceof Error ? err.message : 'Unknown error' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  }
+}
+
+// --- end R2 proxy implementations -------------------------------------------------
 async function createAudit(req: AuditRequest, env: Env): Promise<Response> {
   try {
     const { document_id, filename, file_size, file_type } = req;
@@ -82,79 +148,6 @@ async function createAudit(req: AuditRequest, env: Env): Promise<Response> {
   }
 }
 
-// Endpoint 2: Upload File to R2 (presigned)
-async function generatePresignedPut(req: PresignedRequest, env: Env): Promise<Response> {
-  try {
-    const { key, expiresIn } = req;
-    const client = getS3Client(env);
-
-    const command = new PutObjectCommand({
-      Bucket: 'a11y-document-bucket',
-      Key: key,
-    });
-
-    const presignedUrl = await getSignedUrl(client, command, { expiresIn });
-
-    const expiresAt = new Date(Date.now() + expiresIn * 1000);
-
-    return new Response(
-      JSON.stringify({
-        success: true,
-        presignedUrl,
-        expiresIn,
-        expiresAt: expiresAt.toISOString(),
-      }),
-      { headers: { 'Content-Type': 'application/json' }, status: 200 }
-    );
-  } catch (error) {
-    console.error('Presigned PUT error:', error);
-    return new Response(
-      JSON.stringify({
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      }),
-      { headers: { 'Content-Type': 'application/json' }, status: 500 }
-    );
-  }
-}
-
-// Endpoint 3: Download File from R2 (presigned)
-async function generatePresignedGet(req: PresignedRequest, env: Env): Promise<Response> {
-  try {
-    const { key, expiresIn } = req;
-    const client = getS3Client(env);
-
-    const command = new GetObjectCommand({
-      Bucket: 'a11y-document-bucket',
-      Key: key,
-    });
-
-    const presignedUrl = await getSignedUrl(client, command, { expiresIn });
-
-    const expiresAt = new Date(Date.now() + expiresIn * 1000);
-
-    return new Response(
-      JSON.stringify({
-        success: true,
-        presignedUrl,
-        expiresIn,
-        expiresAt: expiresAt.toISOString(),
-      }),
-      { headers: { 'Content-Type': 'application/json' }, status: 200 }
-    );
-  } catch (error) {
-    console.error('Presigned GET error:', error);
-    return new Response(
-      JSON.stringify({
-        success: false,
-        error: error instanceof Error ? error.message : 'Unknown error',
-      }),
-      { headers: { 'Content-Type': 'application/json' }, status: 500 }
-    );
-  }
-}
-
-// Endpoint 4: Update Audit Results in D1
 async function updateAuditResults(req: UpdateAuditRequest, env: Env): Promise<Response> {
   try {
     const { audit_id, wcag_requirements } = req;
@@ -271,8 +264,8 @@ export default {
     // CORS headers
     const corsHeaders = {
       'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     };
 
     // Handle CORS preflight
@@ -280,7 +273,7 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
-    try {
+    try { 
       // POST /create-audit
       if (pathname === '/create-audit' && method === 'POST') {
         const body = await request.json() as AuditRequest;
@@ -291,24 +284,41 @@ export default {
         });
       }
 
-      // POST /presigned-put
+      // POST /presigned-put  (returns a worker upload URL — client then PUT/POST to /upload/:key)
       if (pathname === '/presigned-put' && method === 'POST') {
         const body = await request.json() as PresignedRequest;
-        const response = await generatePresignedPut(body, env);
-        return new Response(response.body, {
-          status: response.status,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
+        const response = await generatePresignedPut(body, env, request.url);
+        const text = await response.text();
+        return new Response(text, { status: response.status, headers: { ...corsHeaders, 'Content-Type': response.headers.get('Content-Type') || 'application/json' } });
       }
 
-      // POST /presigned-get
+      // POST /presigned-get  (returns a worker download URL)
       if (pathname === '/presigned-get' && method === 'POST') {
         const body = await request.json() as PresignedRequest;
-        const response = await generatePresignedGet(body, env);
-        return new Response(response.body, {
-          status: response.status,
-          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-        });
+        const response = await generatePresignedGet(body, env, request.url);
+        const text = await response.text();
+        return new Response(text, { status: response.status, headers: { ...corsHeaders, 'Content-Type': response.headers.get('Content-Type') || 'application/json' } });
+      }
+
+      // POST /upload/:key  (proxy upload to R2)
+      if (pathname.startsWith('/upload/') && (method === 'POST' || method === 'PUT')) {
+        const key = decodeURIComponent(pathname.split('/')[2] || '');
+        const inner = await handleUploadProxy(request, env, key);
+        const body = await inner.text();
+        return new Response(body, { status: inner.status, headers: { ...corsHeaders, 'Content-Type': inner.headers.get('Content-Type') || 'application/json' } });
+      }
+
+      // GET /download/:key  (proxy download from R2)
+      if (pathname.startsWith('/download/') && method === 'GET') {
+        const key = decodeURIComponent(pathname.split('/')[2] || '');
+        const inner = await handleDownloadProxy(key, env);
+        // forward binary stream or JSON error
+        const ct = inner.headers.get('Content-Type') || 'application/octet-stream';
+        if (ct.startsWith('application/json')) {
+          const body = await inner.text();
+          return new Response(body, { status: inner.status, headers: { ...corsHeaders, 'Content-Type': ct } });
+        }
+        return new Response(inner.body, { status: inner.status, headers: { ...corsHeaders, 'Content-Type': ct } });
       }
 
       // POST /update-audit
