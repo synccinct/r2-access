@@ -1,4 +1,4 @@
-name = "r2-zapier-worker"
+name = "r2-access"
 main = "src/index.ts"
 compatibility_date = "2026-01-30"
 
@@ -14,8 +14,8 @@ bucket_name = "a11y-document-bucket"
 # D1 Database binding
 [[d1_databases]]
 binding = "DB"
-database_name = "a11y_compliance_tracker"
-database_id = "YOUR_DATABASE_ID"
+database_name = "a11y_doc_db"
+database_id = "2be1e452-fe3a-4ab2-a04a-63b471e11afa"
 
 [env.production]
 vars = { ACCOUNT_ID = "YOUR_ACCOUNT_ID", BUCKET_NAME = "a11y-document-bucket" }
