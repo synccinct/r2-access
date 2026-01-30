@@ -1,0 +1,22 @@
+name = "r2-zapier-worker"
+main = "src/index.ts"
+compatibility_date = "2026-01-30"
+
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "a11y-docs-input"
+preview_bucket_name = "a11y-docs-input-preview"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "a11y_compliance_tracker"
+database_id = "paste_your_database_id"
+
+[env.production]
+vars = { ACCOUNT_ID = "YOUR_ACCOUNT_ID", BUCKET_NAME = "a11y-docs-input" }
+
+[env.development]
+vars = { ACCOUNT_ID = "YOUR_ACCOUNT_ID", BUCKET_NAME = "a11y-docs-input-preview" }
+
+[build]
+command = "npm run build"
