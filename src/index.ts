@@ -1,330 +1,365 @@
-import { AwsClient } from 'aws4fetch';
-import {
-  PutObjectCommand,
-  GetObjectCommand,
-} from '@aws-sdk/client-s3';
+import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { aws4Fetch } from 'aws4fetch';
 
 interface Env {
   R2_BUCKET: R2Bucket;
   DB: D1Database;
   R2_ACCESS_KEY_ID: string;
   R2_SECRET_ACCESS_KEY: string;
-  ACCOUNT_ID: string;
-  BUCKET_NAME: string;
 }
 
-// Response helpers
-function responseJSON(data: unknown, statusCode = 200) {
-  return new Response(JSON.stringify(data), {
-    status: statusCode,
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': '*',
-    },
-  });
+interface AuditRequest {
+  document_id: string;
+  filename: string;
+  file_size: number;
+  file_type?: string;
 }
 
-function responseError(error: string, statusCode = 400) {
-  return responseJSON({ error, timestamp: new Date().toISOString() }, statusCode);
+interface PresignedRequest {
+  key: string;
+  expiresIn: number;
 }
 
-// S3 Client for presigned URLs
-function configureS3Client(env: Env) {
-  return new AwsClient({
-    accessKeyId: env.R2_ACCESS_KEY_ID,
-    secretAccessKey: env.R2_SECRET_ACCESS_KEY,
-    region: 'auto',
-    service: 's3',
-    endpointUrl: `https://${env.ACCOUNT_ID}.r2.cloudflarestorage.com`,
-  });
-}
-
-// ENDPOINT 1: PUT - Upload file to R2
-async function handlePut(request: Request, env: Env) {
-  const { key, body } = (await request.json()) as {
-    key: string;
-    body: string;
-  };
-
-  if (!key || !body) {
-    return responseError('Missing key or body');
-  }
-
-  try {
-    const buffer = Buffer.from(body, 'base64');
-    const result = await env.R2_BUCKET.put(key, buffer, {
-      httpMetadata: { contentType: 'application/octet-stream' },
-    });
-
-    return responseJSON({
-      success: true,
-      key: result.key,
-      etag: result.etag,
-      size: result.size,
-      uploadedAt: new Date().toISOString(),
-    });
-  } catch (err) {
-    return responseError(
-      `Upload failed: ${err instanceof Error ? err.message : String(err)}`,
-      500
-    );
-  }
-}
-
-// ENDPOINT 2: GET - Download file from R2
-async function handleGet(request: Request, env: Env) {
-  const url = new URL(request.url);
-  const key = url.searchParams.get('key');
-
-  if (!key) {
-    return responseError('Missing key parameter');
-  }
-
-  try {
-    const obj = await env.R2_BUCKET.get(key);
-
-    if (!obj) {
-      return responseError(`Object not found: ${key}`, 404);
-    }
-
-    const body = await obj.arrayBuffer();
-    const base64 = Buffer.from(body).toString('base64');
-
-    return responseJSON({
-      success: true,
-      key: obj.key,
-      size: obj.size,
-      etag: obj.etag,
-      body: base64,
-      uploadedAt: obj.uploaded,
-    });
-  } catch (err) {
-    return responseError(
-      `Download failed: ${err instanceof Error ? err.message : String(err)}`,
-      500
-    );
-  }
-}
-
-// ENDPOINT 3: PRESIGNED_PUT - Generate upload URL
-async function handlePresignedPut(request: Request, env: Env) {
-  const { key, expiresIn } = (await request.json()) as {
-    key: string;
-    expiresIn?: number;
-  };
-
-  if (!key) {
-    return responseError('Missing key');
-  }
-
-  try {
-    const s3Client = configureS3Client(env);
-    const url = await getSignedUrl(
-      s3Client as any,
-      new PutObjectCommand({
-        Bucket: env.BUCKET_NAME,
-        Key: key,
-      }),
-      { expiresIn: expiresIn || 3600 }
-    );
-
-    return responseJSON({
-      success: true,
-      presignedUrl: url,
-      key,
-      expiresIn: expiresIn || 3600,
-      expiresAt: new Date(Date.now() + (expiresIn || 3600) * 1000).toISOString(),
-    });
-  } catch (err) {
-    return responseError(
-      `Presigned URL failed: ${err instanceof Error ? err.message : String(err)}`,
-      500
-    );
-  }
-}
-
-// ENDPOINT 4: PRESIGNED_GET - Generate download URL
-async function handlePresignedGet(request: Request, env: Env) {
-  const { key, expiresIn } = (await request.json()) as {
-    key: string;
-    expiresIn?: number;
-  };
-
-  if (!key) {
-    return responseError('Missing key');
-  }
-
-  try {
-    const s3Client = configureS3Client(env);
-    const url = await getSignedUrl(
-      s3Client as any,
-      new GetObjectCommand({
-        Bucket: env.BUCKET_NAME,
-        Key: key,
-      }),
-      { expiresIn: expiresIn || 3600 }
-    );
-
-    return responseJSON({
-      success: true,
-      presignedUrl: url,
-      key,
-      expiresIn: expiresIn || 3600,
-      expiresAt: new Date(Date.now() + (expiresIn || 3600) * 1000).toISOString(),
-    });
-  } catch (err) {
-    return responseError(
-      `Presigned URL failed: ${err instanceof Error ? err.message : String(err)}`,
-      500
-    );
-  }
-}
-
-// ENDPOINT 5: CREATE_AUDIT - Insert audit record to D1
-async function handleCreateAudit(request: Request, env: Env) {
-  const { document_id, filename, file_size, file_type } = (await request.json()) as {
-    document_id: string;
-    filename: string;
-    file_size?: number;
-    file_type?: string;
-  };
-
-  if (!document_id || !filename) {
-    return responseError('Missing document_id or filename');
-  }
-
-  try {
-    const { results } = await env.DB.prepare(`
-      INSERT INTO document_audits (document_id, filename, file_size, file_type)
-      VALUES (?, ?, ?, ?)
-      RETURNING id, created_at
-    `)
-      .bind(document_id, filename, file_size || null, file_type || null)
-      .run();
-
-    if (!results?.length) {
-      throw new Error('Failed to create audit');
-    }
-
-    return responseJSON({
-      success: true,
-      audit_id: results.id,
-      document_id,
-      created_at: results.created_at,
-      status: 'pending',
-    });
-  } catch (err) {
-    return responseError(
-      `Create audit failed: ${err instanceof Error ? err.message : String(err)}`,
-      500
-    );
-  }
-}
-
-// ENDPOINT 6: UPDATE_AUDIT_RESULTS - Store audit results to D1
-async function handleUpdateAuditResults(request: Request, env: Env) {
-  const results = (await request.json()) as Array<{
-    document_id: string;
+interface UpdateAuditRequest {
+  audit_id: number;
+  wcag_requirements: Array<{
     wcag_id: string;
     status: string;
     severity: string;
     notes: string;
   }>;
+}
 
-  if (!results?.length) {
-    return responseError('Missing results array');
-  }
+// Initialize S3 client for R2
+function getS3Client(env: Env): S3Client {
+  return new S3Client({
+    region: 'auto',
+    credentials: {
+      accessKeyId: env.R2_ACCESS_KEY_ID,
+      secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+    },
+  });
+}
 
+// Endpoint 1: Create Audit Record in D1
+async function createAudit(req: AuditRequest, env: Env): Promise<Response> {
   try {
-    // Bulk insert results
-    for (const result of results) {
-      await env.DB.prepare(`
-        INSERT OR REPLACE INTO audit_results 
-        (document_id, wcag_id, status, issue_severity, remediation_notes)
-        VALUES (?, ?, ?, ?, ?)
-      `)
-        .bind(result.document_id, result.wcag_id, result.status, result.severity, result.notes)
-        .run();
+    const { document_id, filename, file_size, file_type } = req;
+
+    const stmt = env.DB.prepare(
+      `INSERT INTO document_audits (document_id, filename, file_size, file_type, audit_status, created_at)
+       VALUES (?, ?, ?, ?, ?, datetime('now'))
+       RETURNING id, created_at`
+    );
+
+    const result = await stmt.bind(document_id, filename, file_size, file_type || 'application/pdf').first();
+
+    if (!result) {
+      throw new Error('Failed to create audit record');
     }
 
-    // Update document summary
-    const docId = results.document_id;
-    await env.DB.prepare(`
-      UPDATE document_audits 
-      SET 
-        audit_status = 'complete',
-        total_issues = (SELECT COUNT(*) FROM audit_results WHERE document_id = ?),
-        critical_issues = (SELECT COUNT(*) FROM audit_results WHERE document_id = ? AND issue_severity = 'critical'),
-        audit_completed_at = CURRENT_TIMESTAMP
-      WHERE document_id = ?
-    `)
-      .bind(docId, docId, docId)
-      .run();
+    const typedResult = result as Record<string, unknown>;
 
-    return responseJSON({
-      success: true,
-      updated: results.length,
-      document_id: docId,
-    });
-  } catch (err) {
-    return responseError(
-      `Update results failed: ${err instanceof Error ? err.message : String(err)}`,
-      500
+    return new Response(
+      JSON.stringify({
+        success: true,
+        audit_id: typedResult.id,
+        document_id,
+        status: 'pending',
+        created_at: typedResult.created_at,
+      }),
+      { headers: { 'Content-Type': 'application/json' }, status: 200 }
+    );
+  } catch (error) {
+    console.error('Create audit error:', error);
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      }),
+      { headers: { 'Content-Type': 'application/json' }, status: 500 }
     );
   }
 }
 
-// ROUTER
-export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
-    // CORS preflight
-    if (request.method === 'OPTIONS') {
-      return new Response(null, {
-        status: 204,
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': 'Content-Type',
-        },
-      });
+// Endpoint 2: Upload File to R2 (presigned)
+async function generatePresignedPut(req: PresignedRequest, env: Env): Promise<Response> {
+  try {
+    const { key, expiresIn } = req;
+    const client = getS3Client(env);
+
+    const command = new PutObjectCommand({
+      Bucket: 'a11y-docs-input',
+      Key: key,
+    });
+
+    const presignedUrl = await getSignedUrl(client, command, { expiresIn });
+
+    const expiresAt = new Date(Date.now() + expiresIn * 1000);
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        presignedUrl,
+        expiresIn,
+        expiresAt: expiresAt.toISOString(),
+      }),
+      { headers: { 'Content-Type': 'application/json' }, status: 200 }
+    );
+  } catch (error) {
+    console.error('Presigned PUT error:', error);
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      }),
+      { headers: { 'Content-Type': 'application/json' }, status: 500 }
+    );
+  }
+}
+
+// Endpoint 3: Download File from R2 (presigned)
+async function generatePresignedGet(req: PresignedRequest, env: Env): Promise<Response> {
+  try {
+    const { key, expiresIn } = req;
+    const client = getS3Client(env);
+
+    const command = new GetObjectCommand({
+      Bucket: 'a11y-docs-input',
+      Key: key,
+    });
+
+    const presignedUrl = await getSignedUrl(client, command, { expiresIn });
+
+    const expiresAt = new Date(Date.now() + expiresIn * 1000);
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        presignedUrl,
+        expiresIn,
+        expiresAt: expiresAt.toISOString(),
+      }),
+      { headers: { 'Content-Type': 'application/json' }, status: 200 }
+    );
+  } catch (error) {
+    console.error('Presigned GET error:', error);
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      }),
+      { headers: { 'Content-Type': 'application/json' }, status: 500 }
+    );
+  }
+}
+
+// Endpoint 4: Update Audit Results in D1
+async function updateAuditResults(req: UpdateAuditRequest, env: Env): Promise<Response> {
+  try {
+    const { audit_id, wcag_requirements } = req;
+
+    // Update audit status to "in-progress"
+    const updateAuditStmt = env.DB.prepare(
+      `UPDATE document_audits SET audit_status = ? WHERE id = ?`
+    );
+
+    await updateAuditStmt.bind('in-progress', audit_id).run();
+
+    // Insert WCAG requirements
+    const insertReqStmt = env.DB.prepare(
+      `INSERT INTO audit_findings (audit_id, wcag_id, status, severity, notes)
+       VALUES (?, ?, ?, ?, ?)`
+    );
+
+    for (const req of wcag_requirements) {
+      await insertReqStmt
+        .bind(audit_id, req.wcag_id, req.status, req.severity, req.notes)
+        .run();
     }
 
-    const url = new URL(request.url);
-    const path = url.pathname.split('/') || url.searchParams.get('action');
+    return new Response(
+      JSON.stringify({
+        success: true,
+        audit_id,
+        findings_count: wcag_requirements.length,
+        status: 'in-progress',
+      }),
+      { headers: { 'Content-Type': 'application/json' }, status: 200 }
+    );
+  } catch (error) {
+    console.error('Update audit error:', error);
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      }),
+      { headers: { 'Content-Type': 'application/json' }, status: 500 }
+    );
+  }
+}
+
+// Endpoint 5: Get Audit Status
+async function getAuditStatus(auditId: number, env: Env): Promise<Response> {
+  try {
+    const stmt = env.DB.prepare(
+      `SELECT id, document_id, filename, audit_status, created_at
+       FROM document_audits WHERE id = ?`
+    );
+
+    const audit = await stmt.bind(auditId).first();
+
+    if (!audit) {
+      return new Response(
+        JSON.stringify({ success: false, error: 'Audit not found' }),
+        { headers: { 'Content-Type': 'application/json' }, status: 404 }
+      );
+    }
+
+    const findingsStmt = env.DB.prepare(
+      `SELECT wcag_id, status, severity, notes FROM audit_findings WHERE audit_id = ?`
+    );
+
+    const findings = await findingsStmt.bind(auditId).all();
+
+    return new Response(
+      JSON.stringify({
+        success: true,
+        audit,
+        findings: findings.results || [],
+      }),
+      { headers: { 'Content-Type': 'application/json' }, status: 200 }
+    );
+  } catch (error) {
+    console.error('Get status error:', error);
+    return new Response(
+      JSON.stringify({
+        success: false,
+        error: error instanceof Error ? error.message : 'Unknown error',
+      }),
+      { headers: { 'Content-Type': 'application/json' }, status: 500 }
+    );
+  }
+}
+
+// Endpoint 6: Health Check
+async function healthCheck(): Promise<Response> {
+  return new Response(
+    JSON.stringify({
+      success: true,
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      endpoints: {
+        'POST /create-audit': 'Create new audit record',
+        'POST /presigned-put': 'Get presigned URL for upload',
+        'POST /presigned-get': 'Get presigned URL for download',
+        'POST /update-audit': 'Update audit results',
+        'GET /audit/:id': 'Get audit status',
+        'GET /health': 'Health check',
+      },
+    }),
+    { headers: { 'Content-Type': 'application/json' }, status: 200 }
+  );
+}
+
+// Main router
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const { pathname, searchParams } = new URL(request.url);
+    const method = request.method;
+
+    // CORS headers
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type',
+    };
+
+    // Handle CORS preflight
+    if (method === 'OPTIONS') {
+      return new Response(null, { headers: corsHeaders });
+    }
 
     try {
-      switch (path) {
-        case 'put':
-          return request.method === 'POST' ? handlePut(request, env) : responseError('Method not allowed');
-        case 'get':
-          return request.method === 'GET' ? handleGet(request, env) : responseError('Method not allowed');
-        case 'presigned-put':
-          return request.method === 'POST' ? handlePresignedPut(request, env) : responseError('Method not allowed');
-        case 'presigned-get':
-          return request.method === 'POST' ? handlePresignedGet(request, env) : responseError('Method not allowed');
-        case 'create-audit':
-          return request.method === 'POST' ? handleCreateAudit(request, env) : responseError('Method not allowed');
-        case 'update-audit-results':
-          return request.method === 'POST' ? handleUpdateAuditResults(request, env) : responseError('Method not allowed');
-        default:
-          return responseJSON({
-            message: 'A11y Document Remediation API',
-            version: '2.0',
-            endpoints: [
-              'POST /put - Upload to R2',
-              'GET /get?key=X - Download from R2',
-              'POST /presigned-put - Generate upload URL',
-              'POST /presigned-get - Generate download URL',
-              'POST /create-audit - Create audit record in D1',
-              'POST /update-audit-results - Store audit results in D1',
-            ],
-          });
+      // POST /create-audit
+      if (pathname === '/create-audit' && method === 'POST') {
+        const body = await request.json() as AuditRequest;
+        const response = await createAudit(body, env);
+        return new Response(response.body, {
+          status: response.status,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
       }
-    } catch (err) {
-      return responseError(
-        `Server error: ${err instanceof Error ? err.message : String(err)}`,
-        500
+
+      // POST /presigned-put
+      if (pathname === '/presigned-put' && method === 'POST') {
+        const body = await request.json() as PresignedRequest;
+        const response = await generatePresignedPut(body, env);
+        return new Response(response.body, {
+          status: response.status,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+
+      // POST /presigned-get
+      if (pathname === '/presigned-get' && method === 'POST') {
+        const body = await request.json() as PresignedRequest;
+        const response = await generatePresignedGet(body, env);
+        return new Response(response.body, {
+          status: response.status,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+
+      // POST /update-audit
+      if (pathname === '/update-audit' && method === 'POST') {
+        const body = await request.json() as UpdateAuditRequest;
+        const response = await updateAuditResults(body, env);
+        return new Response(response.body, {
+          status: response.status,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+
+      // GET /audit/:id
+      if (pathname.startsWith('/audit/') && method === 'GET') {
+        const auditId = parseInt(pathname.split('/')[2], 10);
+        const response = await getAuditStatus(auditId, env);
+        return new Response(response.body, {
+          status: response.status,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+
+      // GET /health
+      if (pathname === '/health' && method === 'GET') {
+        const response = await healthCheck();
+        return new Response(response.body, {
+          status: 200,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        });
+      }
+
+      // 404
+      return new Response(
+        JSON.stringify({ success: false, error: 'Endpoint not found' }),
+        {
+          status: 404,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        }
+      );
+    } catch (error) {
+      console.error('Request error:', error);
+      return new Response(
+        JSON.stringify({
+          success: false,
+          error: error instanceof Error ? error.message : 'Unknown error',
+        }),
+        {
+          status: 500,
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        }
       );
     }
   },
