@@ -1,6 +1,6 @@
+
 import { S3Client, PutObjectCommand, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { aws4Fetch } from 'aws4fetch';
 
 interface Env {
   R2_BUCKET: R2Bucket;
@@ -173,9 +173,9 @@ async function updateAuditResults(req: UpdateAuditRequest, env: Env): Promise<Re
        VALUES (?, ?, ?, ?, ?)`
     );
 
-    for (const req of wcag_requirements) {
+    for (const requirement of wcag_requirements) {
       await insertReqStmt
-        .bind(audit_id, req.wcag_id, req.status, req.severity, req.notes)
+        .bind(audit_id, requirement.wcag_id, requirement.status, requirement.severity, requirement.notes)
         .run();
     }
 
