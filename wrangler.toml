@@ -3,7 +3,7 @@ main = "src/index.ts"
 compatibility_date = "2026-01-30"
 
 # Update these with YOUR Cloudflare account values:
-account_id = "YOUR_ACCOUNT_ID"
+account_id = "5ecb025a1eb87bfb066a000bde3f0e04"
 workers_dev = true
 
 # R2 Bucket binding - UPDATED to a11y-document-bucket
