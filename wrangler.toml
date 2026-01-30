@@ -1,22 +1,25 @@
-name = "r2-access"
+name = "r2-zapier-worker"
 main = "src/index.ts"
 compatibility_date = "2026-01-30"
 
+# Update these with YOUR Cloudflare account values:
+account_id = "YOUR_ACCOUNT_ID"
+workers_dev = true
+
+# R2 Bucket binding - UPDATED to a11y-document-bucket
 [[r2_buckets]]
 binding = "R2_BUCKET"
 bucket_name = "a11y-document-bucket"
-preview_bucket_name = "a11y-docs-input-preview"
 
+# D1 Database binding
 [[d1_databases]]
 binding = "DB"
-database_name = "a11y_doc_db"
-database_id = "2be1e452-fe3a-4ab2-a04a-63b471e11afa"
+database_name = "a11y_compliance_tracker"
+database_id = "YOUR_DATABASE_ID"
 
 [env.production]
-vars = { ACCOUNT_ID = "YOUR_ACCOUNT_ID", BUCKET_NAME = "a11y-docs-input" }
-
-[env.development]
-vars = { ACCOUNT_ID = "YOUR_ACCOUNT_ID", BUCKET_NAME = "a11y-docs-input-preview" }
+vars = { ACCOUNT_ID = "YOUR_ACCOUNT_ID", BUCKET_NAME = "a11y-document-bucket" }
 
 [build]
 command = "npm run build"
+cwd = "."
